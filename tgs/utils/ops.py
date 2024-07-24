@@ -123,6 +123,16 @@ def get_ray_directions(
 
     return directions
 
+def get_world_directions(intrinsics, w2c_rot, eval_height, eval_width, camera_centers):
+        # Calculate the inverse projection (for all the data in the dataset)
+        camera_ray_directions_i, camera_ray_directions_j = torch.meshgrid([torch.arange(eval_width), torch.arange(eval_height)], indexing='xy')
+        directions = torch.stack([camera_ray_directions_i, camera_ray_directions_j, torch.ones_like(camera_ray_directions_j)], -1)
+        projection_inverse_rot = torch.linalg.pinv(intrinsics@w2c_rot)
+        # Rearrange the directions array
+        new_dirs = torch.flatten(directions, start_dim=0, end_dim = 1).T.type(torch.float32)
+        world_direction_rays = projection_inverse_rot@new_dirs + camera_centers.unsqueeze(dim=-1)
+
+        return world_direction_rays, projection_inverse_rot
 
 def get_rays(
     directions: Float[Tensor, "... 3"],

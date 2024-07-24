@@ -27,7 +27,7 @@ class SimplePointGenerator(BaseModule):
         pointcloud_upsampling_cls: str = ""
         pointcloud_upsampling: dict = field(default_factory=dict)
 
-        flip_c2w_cond: bool = True
+        flip_c2w_cond: bool = False
 
     cfg: Config
 
@@ -65,6 +65,7 @@ class SimplePointGenerator(BaseModule):
         if encoder_hidden_states is None:
             # Camera modulation
             c2w_cond = batch["c2w_cond"].clone()
+            c2w_cond = torch.linalg.pinv(c2w_cond)
             if self.cfg.flip_c2w_cond:
                 c2w_cond[..., :3, 1:3] *= -1
             camera_extri = c2w_cond.view(*c2w_cond.shape[:-2], -1)

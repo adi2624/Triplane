@@ -16,7 +16,13 @@ from tgs.utils.ops import points_projection
 from tgs.utils.misc import load_module_weights
 from tgs.utils.typing import *
 
+from torch.utils.data.sampler import SubsetRandomSampler
+from pytorch3d.loss import chamfer_distance
+from emd import earth_mover_distance
 from PIL import Image
+
+import logging
+logger = logging.getLogger(__name__)
 
 class TGS(torch.nn.Module, SaverMixin):
     @dataclass
@@ -61,7 +67,7 @@ class TGS(torch.nn.Module, SaverMixin):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = parse_structured(self.Config, cfg)
-        self.vis = True
+        self.vis = False
         self._save_dir: Optional[str] = None
 
         self.image_tokenizer = tgs.find(self.cfg.image_tokenizer_cls)(
@@ -102,7 +108,6 @@ class TGS(torch.nn.Module, SaverMixin):
     
     def _forward(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         img_path = batch["path"]
-        print(f"Loading image: {img_path}")
         if self.vis:
         # Visualize the input image
             in_img = batch["rgb_cond"][0,0].detach().cpu().numpy()
@@ -119,7 +124,8 @@ class TGS(torch.nn.Module, SaverMixin):
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(pointclouds.detach().cpu().numpy()[0])
             o3d.visualization.draw_geometries([pcd])
-
+        
+        """
         batch_size, n_input_views = batch["rgb_cond"].shape[:2]
 
         # Camera modulation
@@ -163,10 +169,13 @@ class TGS(torch.nn.Module, SaverMixin):
                                 **batch)
 
         return {**out, **rend_out}
+        """
+        return {**out}
     
     def forward(self, batch):
         out = self._forward(batch)
         batch_size = batch["index"].shape[0]
+        """
         for b in range(batch_size):
             #if batch["view_index"][b, 0] == 0:
             out["3dgs"][b].save_ply(self.get_save_path(f"3dgs/{batch['instance_id'][b]}.ply"))
@@ -183,9 +192,9 @@ class TGS(torch.nn.Module, SaverMixin):
                         }
                     ]
                 )
+        """
         return out
         
-
 if __name__ == "__main__":
     import argparse
     import subprocess
@@ -204,43 +213,125 @@ if __name__ == "__main__":
 
     cfg: ExperimentConfig = load_config(args.config, cli_args=extras)
     from huggingface_hub import hf_hub_download
-    #model_path = hf_hub_download(repo_id="VAST-AI/TriplaneGaussian", local_dir="./checkpoints", filename="model_lvis_rel.ckpt", repo_type="model")
-    model_path = "checkpoints/ckpt.pt"
+    model_path = hf_hub_download(repo_id="VAST-AI/TriplaneGaussian", local_dir="./checkpoints", filename="model_lvis_rel.ckpt", repo_type="model")
+    # model_path = "checkpoints/model_lvis_rel.ckpt"
     cfg.system.weights=model_path
     model = TGS(cfg=cfg.system).to(device)
     model.set_save_dir(args.out)
     print("load model ckpt done.")
 
-    # run image segmentation for images
-    if args.image_preprocess:
-        segmented_image_list = []
-        for image_path in tqdm.tqdm(cfg.data.image_list):
-            filepath, ext = os.path.splitext(image_path)
-            save_path = os.path.join(filepath + "_rgba.png")
-            segmented_image_list.append(save_path)
-            subprocess.run([f"python image_preprocess/run_sam.py --image_path {image_path} --save_path {save_path}"], shell=True)
-        cfg.data.image_list = segmented_image_list
-
     cfg.data.cond_camera_distance = args.cam_dist
     cfg.data.eval_camera_distance = args.cam_dist
     dataset = CustomImageOrbitDataset(cfg.data)
-    dataloader = DataLoader(dataset,
+
+    train_split, valid_split, test_split = 0.05,0.2,0.2
+    random_seed = 45
+
+    total_samples = len(dataset)
+    indices = list(range(total_samples))
+    split_val, test_val, train_val = int(np.floor(valid_split * total_samples)), int(np.floor(test_split * total_samples)), int(np.floor(train_split * total_samples))
+    np.random.seed(random_seed)
+    np.random.shuffle(indices)
+    val_indices, test_indices, train_indices,  = indices[:split_val], indices[split_val:split_val + test_val], indices[split_val + test_val:split_val + test_val + train_val]
+    train_sampler = SubsetRandomSampler(train_indices)
+    valid_sampler = SubsetRandomSampler(val_indices)
+    test_sampler = SubsetRandomSampler(test_indices)
+
+    train_dataloader = DataLoader(dataset,
                         batch_size=cfg.data.eval_batch_size, 
                         num_workers=cfg.data.num_workers,
-                        shuffle=True,
-                        collate_fn=dataset.collate
+                        shuffle=False,
+                        collate_fn=dataset.collate,
+                        sampler=train_sampler
                     )
-
-    for batch in dataloader:
-        batch = todevice(batch)
-        model(batch)
     
-    """
-    model.save_img_sequences(
-        "video",
-        "(\d+)\.png",
-        save_format="mp4",
-        fps=30,
-        delete=True,
-    )
-    """
+    val_dataloader = DataLoader(dataset,
+                    batch_size=cfg.data.eval_batch_size, 
+                    num_workers=cfg.data.num_workers,
+                    shuffle=False,
+                    collate_fn=dataset.collate,
+                    sampler=valid_sampler
+                )
+
+    test_dataloader = DataLoader(dataset,
+                    batch_size=cfg.data.eval_batch_size, 
+                    num_workers=cfg.data.num_workers,
+                    shuffle=False,
+                    collate_fn=dataset.collate,
+                    sampler=test_sampler
+                )
+    
+    optimizer = torch.optim.Adam(model.parameters(),lr=1e-3)
+
+    logging.basicConfig(filename='training.log', level=logging.INFO)
+
+
+    def train_one_epoch(epoch):
+        logger.info(f"Epoch num: {epoch}")
+        # Train one epoch of the camera embedder and point cloud decoder networks
+        from tqdm import tqdm
+        loss_total = 0
+        num_examples = 0
+        for batch in tqdm(train_dataloader):
+
+            optimizer.zero_grad()
+
+            batch = todevice(batch)
+            out = model(batch)
+            pointclouds = out["points"]
+
+            label_pcl = torch.Tensor(np.expand_dims(np.asarray(o3d.io.read_point_cloud(batch["pcl_dense"][0]).points), axis=0)).to(device='cuda')
+            # Calculate the EMD and Chamfer distance loss
+
+            loss, loss_normals = chamfer_distance(pointclouds, label_pcl)
+            emd_loss = earth_mover_distance(pointclouds, label_pcl, transpose=False)
+
+            total_loss = 1e5*loss + emd_loss
+
+            total_loss.backward()
+
+            optimizer.step()
+
+            loss_total += total_loss.detach().cpu().numpy()
+            num_examples += 1
+
+            if num_examples%123 == 0:
+                logger.info(f"[TRAINING] Loss after 500 images at epoch {epoch} is: {loss_total/num_examples}")
+                print(f"[TRAINING] Loss after 500 images at epoch {epoch} is: {loss_total/num_examples}")
+        """
+        num_valid_examples, valid_loss_total = 0, 0
+        for batch in tqdm(val_dataloader):
+            batch = todevice(batch)
+            out = model(batch)
+            pointclouds = out["points"]
+            label_pcl = torch.Tensor(np.expand_dims(np.asarray(o3d.io.read_point_cloud(batch["pcl_dense"][0]).points), axis=0)).to(device='cuda')
+            # Calculate the EMD and Chamfer distance loss
+            valid_loss, _ = chamfer_distance(pointclouds, label_pcl)
+            emd_loss = earth_mover_distance(pointclouds, label_pcl, transpose=False)
+            valid_loss_total += valid_loss.detach().cpu().numpy()
+            num_valid_examples += 1
+
+        logger.info(f"[VALIDATION] Valid loss at epoch {epoch} is: {valid_loss_total/num_valid_examples}")
+        print(f"[VALIDATION] Valid loss at epoch {epoch} is: {valid_loss_total/num_valid_examples}")
+        """
+        return loss_total/num_examples
+
+
+    def train(num_epochs = 20):
+        # Freeze all networks except camera embedder and pointcloud decoder
+        for name, param in model.named_parameters():
+            if 'pointcloud_generator' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+
+        for epoch in range(num_epochs):
+            loss_per_epoch = train_one_epoch(epoch)
+            torch.save({
+                'epoch': epoch,
+                'state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                }, f"./checkpoints/ckpt.pt")
+
+
+    train(num_epochs=50)

@@ -1,5 +1,5 @@
 data:
-  image_list:
+  image_list: 
   background_color: [1.0, 1.0, 1.0]
   cond_width: 252 # multiply of 14
   cond_height: 252
